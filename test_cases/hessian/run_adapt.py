@@ -1,4 +1,4 @@
-from mismip_adapt import *
+from glac_adapt import *
 import argparse
 
 rank = COMM_WORLD.rank
@@ -13,15 +13,25 @@ args = parser.parse_args()
 chk_idx = args.chk_idx
 options = Options(end_time=3000, chk_idx=chk_idx)
 
+print(options)
+print(type(options))
+print(options['domain'])
+print(options.domain)
+
 if chk_idx == 0:
+    initial_mesh = RectangleMesh(100, 16, options.domain.Lx, options.domain.Ly)
+
+
     # initial_mesh = afile.
-    with CheckpointFile("../initial_mesh.h5", 'r') as afile:
-        initial_mesh = afile.load_mesh("firedrake_default")
+    # with CheckpointFile("../initial_mesh.h5", 'r') as afile:
+    #     initial_mesh = afile.load_mesh("firedrake_default")
 else:
     with CheckpointFile(args.input + f"adapted_{chk_idx}.h5", 'r') as afile:
         initial_mesh = afile.load_mesh(f"adapted_mesh_{chk_idx}")
 
 options['initial_mesh'] = initial_mesh
 GlacierGOMS = Glacier(options)
+
+
 
 

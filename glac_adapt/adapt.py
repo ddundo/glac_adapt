@@ -1,4 +1,4 @@
-from mismip_adapt import *
+from glac_adapt import *
 # from firedrake.petsc import PETSc
 # from firedrake import max_value
 from icepack.models import IceStream
@@ -12,11 +12,11 @@ class Glacier(MeshSeq):
     adaptive simulations of the MISMIP benchmark problem.
     """
 
-    @PETSc.Log.EventDecorator()
+    # @PETSc.Log.EventDecorator()
     def __init__(self, options, root_dir, num_subintervals):
         self.options = options
 
-        fields = "u"
+        fields = ["u"]
         dt = options.simulation.timestep
         dt_per_export = [int(options.simulation.export_time / dt)] * num_subintervals
         time_partition = TimePartition(
@@ -33,10 +33,6 @@ class Glacier(MeshSeq):
         super(Glacier, self).__init__(
             time_partition,
             initial_meshes,
-            None,
-            None,
-            None,
-            None,
             qoi_type="steady",
         )
 
@@ -109,14 +105,12 @@ class Glacier(MeshSeq):
             return {"u": u}
         return solver
 
-    
     def get_initial_condition(self):
         V = self.function_spaces.u[0]
         x = SpatialCoordinate(self[0])[0]
         u = interpolate(as_vector((90 * x / self.options.domain.Lx, 0)), V)
 
         return {'u': u}
-
 
     def get_form(self):
         def form(index, sols):
@@ -210,6 +204,13 @@ def mismip_bed_topography(msh, Ly):
 
 
 def friction_law(**kwargs):
+    from icepack.constants import (
+        ice_density as rho_I,
+        water_density as rho_W,
+        gravity as g,
+        weertman_sliding_law as m,
+    )
+
     variables = ("velocity", "thickness", "surface", "friction")
     u, h, s, C = map(kwargs.get, variables)
 
