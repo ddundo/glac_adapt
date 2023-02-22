@@ -3,38 +3,45 @@ from glac_adapt import *
 # from firedrake import max_value
 from icepack.models import IceStream
 from icepack.solvers import FlowSolver
+from icepack import compute_surface
 from tqdm import trange
+from math import ceil
 
 
-class Glacier(MeshSeq):
+class Glacier(GoalOrientedMeshSeq):  # TODO: switch
     """
     Class to facilitate goal-oriented metric-based mesh
     adaptive simulations of the MISMIP benchmark problem.
     """
 
     # @PETSc.Log.EventDecorator()
-    def __init__(self, options, root_dir, num_subintervals):
+    def __init__(self, options, num_subintervals):
         self.options = options
 
         fields = ["u"]
-        dt = options.simulation.timestep
-        dt_per_export = [int(options.simulation.export_time / dt)] * num_subintervals
+        dt_per_export = [ceil(options.simulation.end_time/(options.simulation.timestep*10))] * num_subintervals
         time_partition = TimePartition(
             options.simulation.end_time,
             num_subintervals,
-            dt,
+            options.simulation.timestep,
             fields,
             timesteps_per_export=dt_per_export,
         )
 
-        initial_meshes = [options.initial_mesh]
+        meshes = [options.initial_mesh] * num_subintervals
 
         # Create GoalOrientedMeshSeq
-        super(Glacier, self).__init__(
+        super().__init__(
             time_partition,
-            initial_meshes,
+            meshes,
+            get_function_spaces=self.get_function_spaces,
+            get_form=self.get_form,
+            get_bcs=self.get_bcs,
+            get_solver=self.get_solver,
+            get_qoi=self.get_qoi,
             qoi_type="steady",
         )
+
 
     # @PETSc.Log.EventDecorator()
     def get_function_spaces(self, mesh):
@@ -55,8 +62,8 @@ class Glacier(MeshSeq):
             msh = ic.u.function_space().mesh()
             fspace = ic.u.function_space()
 
-            options.simulation_end_time = t_end
-            i_export = int(np.round(t_start / options.simulation_export_time))
+            # options.simulation_end_time = t_end
+            # i_export = int(np.round(t_start / options.simulation_export_time))
 
             u_ = Function(fspace, name="u_old")
             u_.assign(ic["u"])
@@ -66,33 +73,34 @@ class Glacier(MeshSeq):
             Q = FunctionSpace(msh, "CG", fspace._ufl_element.degree())
 
             self.icepack_model = IceStream(friction=friction_law)
-            self.icepack_solver = FlowSolver(icepack_model, **opts)
+            self.icepack_solver = FlowSolver(
+                self.icepack_model, **options.domain, **options.solvers)
 
             self.z_b = interpolate(mismip_bed_topography(msh, options.domain.Ly), Q)
             self.h = interpolate(Constant(100), Q)
-            self.s = compute_surface(thickness=h, bed=z_b)
+            self.s = compute_surface(thickness=self.h, bed=self.z_b)
 
             h_0 = self.h.copy(deepcopy=True)
-            num_steps = int((t_end - t_start) / self.options.simulation.dt)
+            num_steps = int((t_end - t_start) / options.simulation.timestep)
             progress_bar = trange(num_steps)
 
-            for step in progress_bar:
-                self.h = icepack_solver.prognostic_solve(
-                    dt,
-                    thickness=h,
+            for _ in progress_bar:
+                self.h = self.icepack_solver.prognostic_solve(
+                    options.timestep,
+                    thickness=self.h,
                     velocity=u,
-                    accumulation=options.const.acc_rate,
+                    accumulation=options.constants.acc_rate,
                     thickness_inflow=h_0
                 )
-                self.h.interpolate(max_value(h, 1.0))
+                self.h.interpolate(max_value(self.h, 1.0))
                 self.s = compute_surface(thickness=self.h, bed=self.z_b)
 
-                u = icepack_solver.diagnostic_solve(
+                u = self.icepack_solver.diagnostic_solve(
                     velocity=u,
                     thickness=self.h,
                     surface=self.s,
-                    fluidity=options.const.fluidity,
-                    friction=options.const.friction
+                    fluidity=options.constants.viscosity,
+                    friction=options.constants.friction
                 )
 
                 min_h = self.h.dat.data_ro.min()
@@ -112,17 +120,35 @@ class Glacier(MeshSeq):
 
         return {'u': u}
 
+
+    def get_bcs(self):
+        def bcs(index):
+            V = self.function_spaces["u"][index]
+
+            if hasattr(V._ufl_element, "_sub_element"):
+                bc = DirichletBC(V, Constant((0, 0)), self.options.domain.dirichlet_ids)
+            else:
+                bc = DirichletBC(V, Constant(0), self.options.domain.dirichlet_ids)
+            if not self.options.domain.dirichlet_ids:
+                bc = None
+
+            return bc
+        return bcs
+
+
     def get_form(self):
         def form(index, sols):
             u, u_ = sols["u"]
+
             action = self.icepack_solver._diagnostic_solver._model.action(
                 velocity=u,
                 thickness=self.h,
                 surface=self.s,
-                fluidity=self.options.const.fluidity,
-                friction=self.options.const.friction,
+                fluidity=self.options.constants.viscosity,
+                friction=self.options.constants.friction,
                 **self.options.domain
             )
+
             F = derivative(action, u)
 
             return F
@@ -134,48 +160,68 @@ class Glacier(MeshSeq):
             u = sol["u"]
             msh = self[index]
 
-            # metadata = {
-            #     "quadrature_degree": self.icepack_solver._diagnostic_solver._model.quadrature_degree(velocity=u, thickness=self.h),
-            # }
-            # _ds = ds(domain=msh, metadata=metadata)
-
             v = FacetNormal(msh)
             j = self.h * inner(u, v) * ds(self.options.domain.ice_front_ids)
 
-            return j
+            return assemble(j)
         return qoi
 
     
-    def adaptor(self, sols, inds):
-        chk_idx = self.options.simulation.chk_idx
-        sol_u = sols['u']['forward'][0][-1]
+    # def fpi(
+    #     self,
+    #     adaptor: Callable,
+    #     enrichment_kwargs: dict = {},
+    #     adj_kwargs: dict = {},
+    #     indicator_fn: Callable = get_dwr_indicator,
+    #     **kwargs,
+    # ):
+    #     update_params = kwargs.get("update_params")
+    #     P = self.params
+    #     self.element_counts = [self.count_elements()]
+    #     self.qoi_values = []
+    #     self.estimator_values = []
+    #     self.converged = False
+    #     msg = "Terminated due to {:s} convergence after {:d} iterations"
+    #     for fp_iteration in range(P.maxiter):
+    #         if update_params is not None:
+    #             update_params(P, fp_iteration)
 
-        Q = FunctionSpace(self[0], family='cg', degree=1)
-        ux = Function(Q)
-        ux.interpolate(sol_u[0])
-        xHess = recover_hessian(sol_u[0])
-        metricxHess = hessian_metric(xHess)
+    #         # Indicate errors over all meshes
+    #         sols, indicators = self.indicate_errors(
+    #             enrichment_kwargs=enrichment_kwargs,
+    #             adj_kwargs=adj_kwargs,
+    #             indicator_fn=indicator_fn,
+    #         )
 
-        metcom = metric_complexity(xHess)
-        Nvert = 3000
-        d = 2
-        alpha = (Nvert / metcom) ** (2/d)
+    #         # Check for QoI convergence
+    #         # TODO: Put this check inside the adjoint solve as
+    #         #       an optional return condition so that we
+    #         #       can avoid unnecessary extra solves
+    #         self.qoi_values.append(self.J)
+    #         self.check_qoi_convergence()
+    #         if self.converged:
+    #             pyrint(msg.format("QoI", fp_iteration + 1))
+    #             break
 
-        metricxHess.assign(alpha*metricxHess)
+    #         # Check for error estimator convergence
+    #         ee = indicators2estimator(indicators, self.time_partition)
+    #         self.estimator_values.append(ee)
+    #         self.check_estimator_convergence()
+    #         if self.converged:
+    #             pyrint(msg.format("error estimator", fp_iteration + 1))
+    #             break
 
-        with CheckpointFile('temp_chk.h5', 'w') as afile:
-            afile.save_mesh(self[0])
-            afile.save_function(metricxHess, name="metric")
+    #         # Adapt meshes and log element counts
+    #         adaptor(self, sols, indicators)
+    #         self.element_counts.append(self.count_elements())
 
-        if COMM_WORLD.rank == 0:
-            with CheckpointFile('temp_chk.h5', 'r', comm=COMM_SELF) as afile:
-                old_mesh = afile.load_mesh(f"adapted_mesh_{chk_idx}")  # TODO: is this needed? self?
-        # old_mesh = self[0]
-            metric = reorderec_vec(metricxHess, old_mesh)
-            newplex = old_mesh.topology_dm.adaptMetric(metric, "Face Sets", "Cell Sets")
-            adapted_mesh = mesh(newplex, 
-                                distribution_parameters={"partition": False}, 
-                                name=f"adapted_mesh_{chk_idx}")
+    #         # Check for element count convergence
+    #         self.check_element_count_convergence()
+    #         if self.converged:
+    #             pyrint(msg.format("element count", fp_iteration + 1))
+    #             break
+    #     if not self.converged:
+    #         pyrint(f"Failed to converge in {P.maxiter} iterations")
 
 
 def mismip_bed_topography(msh, Ly):
